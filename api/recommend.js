@@ -15,7 +15,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const GEMINI_MODEL_DEFAULT = 'gemini-2.5-flash';
-const MAX_CANDIDATES = 25;
+const MAX_CANDIDATES = 15;
 const CACHE_TTL_MS = 10 * 60 * 1000; // 정책 DB 캐시 10분 (같은 인스턴스가 살아 있는 동안)
 
 const LABELS = {
@@ -203,29 +203,36 @@ const KW = {
 function selectCandidates(ctx, policyRows, regionRows, codeRows) {
   const today = todayStr();
   const P = picker(policyRows);
+  // 첫 번째 별칭 = Supabase lt_policies 실제 컬럼명 (2026-11-20 확인), 나머지는 예비
   const COL = {
-    policy_id:       P(['plcyNo', 'policy_id', 'policyId', 'plcy_no', 'id']),
-    title:           P(['plcyNm', 'policy_name', 'title', 'plcy_nm', '정책명']),
-    provider:        P(['operInstCdNm', 'sprvsnInstCdNm', 'provider', 'institution', '운영기관명', '주관기관명']),
-    summary:         P(['plcyExplnCn', 'summary', 'description', 'policy_description', '정책설명']),
-    support_details: P(['plcySprtCn', 'support_details', 'support_content', '지원내용']),
-    eligibility:     P(['addAplyQlfcCndCn', 'eligibility', 'qualification', 'apply_qualification', '자격조건', '신청자격']),
-    exclusion:       P(['ptcpPrpTrgtCn', 'exclusion', 'exclusion_target', '참여제외대상']),
-    apply_method:    P(['plcyAplyMthdCn', 'apply_method', '신청방법']),
-    keywords:        P(['plcyKywdNm', 'keywords', 'keyword', '정책키워드']),
-    job_code:        P(['jobCd', 'job_cd', 'job_status', 'job_status_code', 'employment_status', '취업상태']),
-    min_age:         P(['sprtTrgtMinAge', 'min_age', 'age_min']),
-    max_age:         P(['sprtTrgtMaxAge', 'max_age', 'age_max']),
-    apply_period:    P(['aplyYmd', 'apply_period', 'aply_ymd', '신청기간']),
-    apply_start:     P(['apply_start', 'apply_start_date', 'aplyBgngYmd', 'aply_bgng_ymd']),
-    apply_end:       P(['apply_end', 'apply_end_date', 'aplyEndYmd', 'aply_end_ymd', 'deadline']),
-    region_codes:    P(['zipCd', 'zip_cd', 'region_codes', 'region_code', 'regions', '지역코드']),
-    region_names:    P(['region_names', 'region_name', 'region_nm', '지역명'], ['regionname', '지역명']),
-    detail_url:      P(['refUrlAddr1', 'detail_url', 'ref_url', 'url']),
-    apply_url:       P(['aplyUrlAddr', 'apply_url', 'aply_url_addr']),
-    event_type:      P(['event_type', 'event_types', 'schedule_type', 'event_category', '일정유형', '이벤트유형'], ['eventtype', 'event', '일정유형', '이벤트']),
-    job_relevance:   P(['job_relevance', 'employment_relevance', 'relevance', '구직관련성'], ['relevance', '관련성']),
-    target_group:    P(['target_group', 'target_groups', 'target', '대상그룹'], ['targetgroup', '대상그룹'])
+    policy_id:       P(['policy_id', 'plcyNo', 'policyId', 'plcy_no', 'id']),
+    title:           P(['title', 'plcyNm', 'policy_name', 'plcy_nm', '정책명']),
+    provider:        P(['provider_name', 'operInstCdNm', 'sprvsnInstCdNm', 'provider', 'institution']),
+    summary:         P(['summary', 'plcyExplnCn', 'description', 'policy_description']),
+    support_details: P(['support_text', 'plcySprtCn', 'support_details', 'support_content']),
+    eligibility:     P(['eligibility_text', 'addAplyQlfcCndCn', 'eligibility', 'qualification']),
+    exclusion:       P(['exclusion_text', 'ptcpPrpTrgtCn', 'exclusion', 'exclusion_target']),
+    apply_method:    P(['apply_method', 'plcyAplyMthdCn']),
+    keywords:        P(['keyword_names', 'plcyKywdNm', 'keywords', 'keyword']),
+    category_l:      P(['lclsf_nm', 'lclsfNm']),
+    category_m:      P(['mclsf_nm', 'mclsfNm']),
+    job_code:        P(['job_codes', 'jobCd', 'job_cd', 'job_status']),
+    income_text:     P(['income_other_text', 'earnEtcCn']),
+    min_age:         P(['min_age', 'sprtTrgtMinAge', 'age_min']),
+    max_age:         P(['max_age', 'sprtTrgtMaxAge', 'age_max']),
+    apply_period:    P(['application_period_raw', 'aplyYmd', 'apply_period']),
+    apply_period_cd: P(['application_period_code', 'aplyPrdSeCd']),
+    apply_start:     P(['apply_start', 'apply_start_date', 'aplyBgngYmd']),
+    apply_end:       P(['apply_end', 'apply_end_date', 'aplyEndYmd', 'deadline']),
+    region_codes:    P(['region_codes', 'zipCd', 'zip_cd', 'regions']),
+    region_names:    P(['region_names', 'region_name', 'region_nm']),
+    nationwide:      P(['is_nationwide', 'nationwide']),
+    detail_url:      P(['source_url', 'refUrlAddr1', 'detail_url', 'ref_url']),
+    apply_url:       P(['apply_url', 'aplyUrlAddr', 'aply_url_addr']),
+    event_type:      P(['event_types', 'event_type', 'schedule_type'], ['eventtype']),
+    job_relevance:   P(['relevance_status', 'job_relevance', 'employment_relevance', 'relevance']),
+    target_group:    P(['target_groups', 'target_group']),
+    review_flags:    P(['review_flags'])
   };
   const get = (row, f) => (COL[f] ? row[COL[f]] : null);
 
@@ -240,14 +247,15 @@ function selectCandidates(ctx, policyRows, regionRows, codeRows) {
     codeText[k] = Object.values(r).map(text).join(' ');
     codeName[k] = codeNameCol ? text(r[codeNameCol]) : '';
   }
-  const codeLabel = v => text(v).split(/[,|;\s]+/).filter(Boolean).map(c => codeName[c] || c).join(', ');
+  const codeList = v => text(v).replace(/[\[\]"{}]/g, '').split(/[,|;\s]+/).filter(Boolean);
+  const codeLabel = v => codeList(v).map(c => codeName[c] || c).join(', ');
 
   // 지역 마스터: 지역코드 → 지역명
   const R = picker(regionRows);
   const rCode = R(['region_code', 'code', 'zip_cd', 'zipCd', 'stdg_cd', '지역코드'], ['code', '코드']);
   const rSido = R(['sido_name', 'sido_nm', 'ctpv_nm', 'sido', '시도명'], ['sido', 'ctpv', '시도']);
   const rSgg = R(['sigungu_name', 'sigungu_nm', 'sgg_nm', 'sigungu', '시군구명'], ['sigungu', 'sgg', '시군구']);
-  const rFull = R(['full_name', 'region_name', 'full_region_name', '전체지역명'], ['full', '전체']);
+  const rFull = R(['region_name', 'full_name', 'full_region_name', '전체지역명'], ['full', '전체']);
   const regionName = {};
   for (const r of regionRows) {
     const code = text(rCode && r[rCode]);
@@ -326,10 +334,13 @@ function selectCandidates(ctx, policyRows, regionRows, codeRows) {
     if (ruleRel === 'REVIEW') ruleRel = 'RELATED';
 
     const { start, end } = periodOf(row);
+    const flags = codeList(get(row, 'review_flags'));
     if (end && end < today) { stats.closed++; continue; }
+    if (text(get(row, 'apply_period_cd')) === '0057003' && !(end && end >= today)) { stats.closed++; continue; } // API 상 마감
 
     const codes = toCodes(get(row, 'region_codes'));
-    const nationwide = codes.length === 0 || codes.length >= 250;
+    const nwFlag = get(row, 'nationwide');
+    const nationwide = nwFlag === true || nwFlag === 'true' || codes.length === 0 || codes.length >= 250;
     const regionOk = nationwide || codes.some(rc =>
       rc === sigunguCode || rc === sidoCode || (parentCity && rc === parentCity) ||
       (!sigunguCode && sidoCode && rc.slice(0, 2) === sidoCode.slice(0, 2)));
@@ -351,6 +362,9 @@ function selectCandidates(ctx, policyRows, regionRows, codeRows) {
       apply_method: text(get(row, 'apply_method')),
       job_status: codeLabel(get(row, 'job_code')),
       target_group: codeLabel(get(row, 'target_group')),
+      income: text(get(row, 'income_text')),
+      category: [text(get(row, 'category_l')), text(get(row, 'category_m'))].filter(Boolean).join(' > '),
+      review_notes: flags.map(f => codeName[f] || f).join(', '),
       min_age: minAge, max_age: maxAge,
       apply_start: start, apply_end: end,
       region_level: nationwide ? 'N' : 'L',
@@ -389,11 +403,13 @@ function candidatesForAi(picked) {
     age: (p.min_age || '-') + '~' + (p.max_age || '-'),
     jobStatus: p.job_status || '제한 없음/미기재',
     targetGroup: p.target_group || '',
+    income: p.income || '',
+    dataReviewNotes: p.review_notes || '',
     applyPeriod: p.apply_start || p.apply_end ? (p.apply_start || '') + ' ~ ' + (p.apply_end || '') : '상시/미기재',
-    summary: cut(p.summary, 500),
-    supportDetails: cut(p.support_details, 700),
-    eligibility: cut(p.eligibility, 700),
-    exclusion: cut(p.exclusion, 400)
+    summary: cut(p.summary, 300),
+    supportDetails: cut(p.support_details, 500),
+    eligibility: cut(p.eligibility, 500),
+    exclusion: cut(p.exclusion, 250)
   }));
 }
 
@@ -473,6 +489,10 @@ async function recommend(body, deps) {
   const base = interpretByRule(body);
 
   // ① 일정 해석 (AI) — 사용자가 이미 고른/답한 카테고리가 있으면 생략
+  // 정책 DB 조회를 미리 시작 (AI 일정 해석과 동시에 진행)
+  const tablesPromise = deps.loadTables();
+  tablesPromise.catch(() => {});
+
   let ai = { category: 'GENERAL', examStage: null, confidence: 0, reason: '' };
   if (!base.userCategory && !(base.answers && base.answers.category) && !base.rule.excluded) {
     try {
@@ -486,7 +506,7 @@ async function recommend(body, deps) {
   if (ctx.status !== 'CONFIRMED') return ctx;
 
   // ② 후보 선별
-  const t = await deps.loadTables();
+  const t = await tablesPromise;
   const { candidates, debug } = selectCandidates(ctx, t.policies, t.regions, t.codes);
   if (!candidates.length) {
     return Object.assign({}, ctx, { status: 'NO_CANDIDATES', message: '조건에 맞는 정책을 찾지 못했습니다. 지역 설정을 변경해 보세요.', policies: [], debug });
@@ -553,6 +573,7 @@ async function loadTables() {
 // 지정한 모델이 없거나(404) 바쁘거나(429/503) 느리면, 이 키로 쓸 수 있는 다른 flash 모델로 넘어감
 let resolvedModel = null;
 let modelListCache = null;
+const noThinkingConfig = new Set();
 async function listFlashModels() {
   if (modelListCache) return modelListCache;
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', {
@@ -625,10 +646,17 @@ async function geminiFetch(model, system, user, maxTokens, signal) {
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ role: 'user', parts: [{ text: user }] }],
-      generationConfig: { temperature: 0, maxOutputTokens: maxTokens, responseMimeType: 'application/json' }
+      generationConfig: Object.assign(
+        { temperature: 0, maxOutputTokens: maxTokens, responseMimeType: 'application/json' },
+        noThinkingConfig.has(model) ? {} : { thinkingConfig: { thinkingLevel: 'low' } } // 응답 속도 우선
+      )
     })
   });
   const j = await r.json().catch(() => ({}));
+  if (!r.ok && r.status === 400 && !noThinkingConfig.has(model) && /thinking/i.test((j.error && j.error.message) || '')) {
+    noThinkingConfig.add(model); // 이 모델은 thinkingLevel 미지원 → 빼고 다시
+    return geminiFetch(model, system, user, maxTokens, signal);
+  }
   if (!r.ok) return { ok: false, status: r.status, message: ((j.error && j.error.message) || '').slice(0, 200) };
   const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
   return { ok: true, status: r.status, text: parts.filter(p => !p.thought).map(p => p.text || '').join('') };
