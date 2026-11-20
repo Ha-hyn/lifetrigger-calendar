@@ -468,6 +468,7 @@ function buildResult(ctx, picked, judged, debug) {
 // ───────────────────────── 전체 흐름 ─────────────────────────
 // deps = { loadTables(): {policies, regions, codes}, llm(system, user, maxTokens): string }
 async function recommend(body, deps) {
+  const startedAt = Date.now();
   const base = interpretByRule(body);
 
   // ① 일정 해석 (AI) — 사용자가 이미 고른/답한 카테고리가 있으면 생략
@@ -475,7 +476,7 @@ async function recommend(body, deps) {
   if (!base.userCategory && !(base.answers && base.answers.category) && !base.rule.excluded) {
     try {
       const out = await deps.llm(EVENT_SYSTEM,
-        '일정 제목: ' + base.event.title + '\n일정 날짜: ' + (base.event.start || '') + '\n사용자가 고른 카테고리: 없음', 512);
+        '일정 제목: ' + base.event.title + '\n일정 날짜: ' + (base.event.start || '') + '\n사용자가 고른 카테고리: 없음', 512, 12000);
       ai = Object.assign(ai, parseJsonLoose(out));
     } catch (e) { ai.reason = 'AI 해석 실패: ' + e.message; }
   }
@@ -499,11 +500,25 @@ async function recommend(body, deps) {
     '\n- 거주 시도코드: ' + ctx.user.sidoCode + ' / 시군구코드: ' + ctx.user.sigunguCode +
     '\n\n[후보 정책 ' + candidates.length + '건 — 이 목록 밖은 판단하지 않는다]\n' + JSON.stringify(candidatesForAi(candidates));
   let judged = [];
-  try { judged = parseJsonLoose(await deps.llm(POLICY_SYSTEM, userMsg, 8192)).results || []; }
+  // 남은 시간 안에서 AI 판단 (Vercel 함수 제한 60초)
+  const budget = Math.max(5000, 52000 - (Date.now() - startedAt));
+  try { judged = parseJsonLoose(await deps.llm(POLICY_SYSTEM, userMsg, 8192, budget)).results || []; }
   catch (e) { debug.aiError = e.message; }
 
+  // AI 판단이 실패하면 규칙 기반 후보를 '확인 필요'로 보여 줌 (빈 화면 방지)
+  if (!judged.length && debug.aiError) {
+    judged = candidates.slice(0, 10).map(p => ({
+      policyId: p.policy_id, relevance: p.rule_relevance, eligibility: 'CHECK', evidence: [], timing: null, note: '',
+      checkItems: ['AI 판단이 일시적으로 실패해 규칙으로만 고른 정책입니다. 원문에서 자격 조건을 확인하세요.']
+    }));
+  }
+
   // ③ 결과 정리
-  return buildResult(ctx, candidates, judged, debug);
+  const result = buildResult(ctx, candidates, judged, debug);
+  if (debug.aiError) result.notices.unshift('AI 판단 서버가 바빠서 규칙 기반 결과만 보여 드려요. 잠시 후 다시 눌러 보세요.');
+  result.debug.model = resolvedModel;
+  result.debug.elapsedMs = Date.now() - startedAt;
+  return result;
 }
 
 // ───────────────────────── 외부 연동 (Supabase · Gemini) ─────────────────────────
@@ -534,9 +549,11 @@ async function loadTables() {
   tableCache = { at: Date.now(), data: { policies, regions, codes } };
   return tableCache.data;
 }
-// 지정한 모델이 없거나 종료되면(404), 이 키로 쓸 수 있는 최신 flash 모델을 찾아 대신 사용
+// 지정한 모델이 없거나(404) 바쁘거나(429/503) 느리면, 이 키로 쓸 수 있는 다른 flash 모델로 넘어감
 let resolvedModel = null;
-async function pickAvailableModel() {
+let modelListCache = null;
+async function listFlashModels() {
+  if (modelListCache) return modelListCache;
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', {
     headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' }
   });
@@ -548,20 +565,43 @@ async function pickAvailableModel() {
   const ver = n => (n.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1] * 1;
   names.sort((a, b) => ver(b) - ver(a) || a.length - b.length);
   if (!names.length) throw new Error('이 Gemini 키로 사용할 수 있는 flash 모델을 찾지 못했습니다. GEMINI_MODEL 환경변수를 지정하세요.');
-  return names[0];
+  modelListCache = names;
+  return names;
 }
-async function gemini(system, user, maxTokens) {
-  let model = resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
-  let out = await geminiCall(model, system, user, maxTokens);
-  if (out.status === 404 && !resolvedModel) {
-    resolvedModel = await pickAvailableModel();
-    out = await geminiCall(resolvedModel, system, user, maxTokens);
+async function pickAvailableModel() { return (await listFlashModels())[0]; }
+
+// budgetMs: 이 호출 전체(모델 전환 포함)에 쓸 수 있는 시간
+async function gemini(system, user, maxTokens, budgetMs) {
+  const end = Date.now() + (budgetMs || 25000);
+  const first = resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
+  const tried = [];
+  let order = [first];
+  let lastErr = '';
+  for (let i = 0; i < 4 && i < order.length; i++) {
+    const left = end - Date.now();
+    if (left < 3000) { lastErr = lastErr || '시간 부족'; break; }
+    const model = order[i];
+    tried.push(model);
+    const out = await geminiCall(model, system, user, maxTokens, left);
+    if (out.ok) { resolvedModel = model; return out.text; }
+    lastErr = '(' + out.status + ', ' + model + ') ' + out.message;
+    if (![404, 429, 500, 503, 504, 408].includes(out.status)) break; // 키 오류 등은 바로 중단
+    if (order.length === 1) {
+      try { order = order.concat((await listFlashModels()).filter(m => m !== first)); } catch (e) { break; }
+    }
   }
-  if (!out.ok) throw new Error('Gemini 오류 (' + out.status + ', ' + (resolvedModel || model) + '): ' + out.message);
-  return out.text;
+  throw new Error('Gemini 오류 ' + lastErr + ' / 시도한 모델: ' + tried.join(', '));
 }
-async function geminiCall(model, system, user, maxTokens) {
+async function geminiCall(model, system, user, maxTokens, timeoutMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try { return await geminiFetch(model, system, user, maxTokens, ac.signal); }
+  catch (e) { return { ok: false, status: e.name === 'AbortError' ? 408 : 500, message: e.name === 'AbortError' ? '응답 시간 초과' : e.message }; }
+  finally { clearTimeout(timer); }
+}
+async function geminiFetch(model, system, user, maxTokens, signal) {
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+    signal,
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY || '' },
     body: JSON.stringify({
