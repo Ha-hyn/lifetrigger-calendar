@@ -534,8 +534,33 @@ async function loadTables() {
   tableCache = { at: Date.now(), data: { policies, regions, codes } };
   return tableCache.data;
 }
+// 지정한 모델이 없거나 종료되면(404), 이 키로 쓸 수 있는 최신 flash 모델을 찾아 대신 사용
+let resolvedModel = null;
+async function pickAvailableModel() {
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', {
+    headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' }
+  });
+  const j = await r.json().catch(() => ({}));
+  const names = (j.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => String(m.name || '').replace(/^models\//, ''))
+    .filter(n => /flash/.test(n) && !/lite|image|tts|audio|live|thinking|exp|preview/.test(n));
+  const ver = n => (n.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1] * 1;
+  names.sort((a, b) => ver(b) - ver(a) || a.length - b.length);
+  if (!names.length) throw new Error('이 Gemini 키로 사용할 수 있는 flash 모델을 찾지 못했습니다. GEMINI_MODEL 환경변수를 지정하세요.');
+  return names[0];
+}
 async function gemini(system, user, maxTokens) {
-  const model = process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
+  let model = resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
+  let out = await geminiCall(model, system, user, maxTokens);
+  if (out.status === 404 && !resolvedModel) {
+    resolvedModel = await pickAvailableModel();
+    out = await geminiCall(resolvedModel, system, user, maxTokens);
+  }
+  if (!out.ok) throw new Error('Gemini 오류 (' + out.status + ', ' + (resolvedModel || model) + '): ' + out.message);
+  return out.text;
+}
+async function geminiCall(model, system, user, maxTokens) {
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY || '' },
@@ -546,9 +571,9 @@ async function gemini(system, user, maxTokens) {
     })
   });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('Gemini 오류 (' + r.status + '): ' + ((j.error && j.error.message) || '').slice(0, 200));
+  if (!r.ok) return { ok: false, status: r.status, message: ((j.error && j.error.message) || '').slice(0, 200) };
   const parts = (((j.candidates || [])[0] || {}).content || {}).parts || [];
-  return parts.map(p => p.text || '').join('');
+  return { ok: true, status: r.status, text: parts.filter(p => !p.thought).map(p => p.text || '').join('') };
 }
 
 // ───────────────────────── HTTP 핸들러 ─────────────────────────
@@ -562,7 +587,8 @@ async function handler(req, res) {
         SUPABASE_URL: !!process.env.SUPABASE_URL,
         SUPABASE_KEY: !!(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY),
         GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
-        GEMINI_MODEL: process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT
+        GEMINI_MODEL: process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT,
+        GEMINI_MODEL_IN_USE: resolvedModel
       }
     });
   }
