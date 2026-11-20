@@ -570,9 +570,25 @@ async function listFlashModels() {
 }
 async function pickAvailableModel() { return (await listFlashModels())[0]; }
 
+// 첫 호출 때: 지정 모델 + 후보 모델들에 동시에 짧게 물어보고 가장 먼저 정상 응답한 모델을 사용
+async function raceModels() {
+  let list = [];
+  try { list = await listFlashModels(); } catch (e) { list = []; }
+  const preferred = process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
+  const pool = [preferred].concat(list.filter(m => m !== preferred)).slice(0, 6);
+  try {
+    return await Promise.any(pool.map(async m => {
+      const out = await geminiCall(m, 'JSON만 출력한다.', '{"ok":true}', 32, 8000);
+      if (!out.ok) throw new Error(m + ' ' + out.status);
+      return m;
+    }));
+  } catch (e) { return null; }
+}
+
 // budgetMs: 이 호출 전체(모델 전환 포함)에 쓸 수 있는 시간
 async function gemini(system, user, maxTokens, budgetMs) {
   const end = Date.now() + (budgetMs || 25000);
+  if (!resolvedModel) resolvedModel = await raceModels();
   const first = resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
   const tried = [];
   let order = [first];
@@ -584,6 +600,7 @@ async function gemini(system, user, maxTokens, budgetMs) {
     tried.push(model);
     const out = await geminiCall(model, system, user, maxTokens, left);
     if (out.ok) { resolvedModel = model; return out.text; }
+    if (model === resolvedModel) resolvedModel = null; // 다음 요청에서 다시 고르기
     lastErr = '(' + out.status + ', ' + model + ') ' + out.message;
     if (![404, 429, 500, 503, 504, 408].includes(out.status)) break; // 키 오류 등은 바로 중단
     if (order.length === 1) {
