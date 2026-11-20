@@ -579,6 +579,18 @@ async function geminiCall(model, system, user, maxTokens) {
 // ───────────────────────── HTTP 핸들러 ─────────────────────────
 async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
+  if (req.method === 'GET' && req.query && req.query.diag) {
+    // 진단: 단계별 소요 시간 (키 값은 노출하지 않음)
+    const d = {}; const t0 = Date.now();
+    try { const t = await loadTables(); d.tables = { ms: Date.now() - t0, policies: t.policies.length, regions: t.regions.length, codes: t.codes.length }; }
+    catch (e) { d.tables = { ms: Date.now() - t0, error: e.message }; }
+    const t1 = Date.now();
+    try { d.modelList = { model: await pickAvailableModel(), ms: Date.now() - t1 }; } catch (e) { d.modelList = { error: e.message }; }
+    const t2 = Date.now();
+    try { const out = await gemini('JSON만 출력한다.', '{"ok":true} 를 그대로 출력', 64); d.gemini = { ms: Date.now() - t2, model: resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT, out: out.slice(0, 80) }; }
+    catch (e) { d.gemini = { ms: Date.now() - t2, error: e.message }; }
+    return res.status(200).json(d);
+  }
   if (req.method === 'GET') {
     return res.status(200).json({
       status: 'ALIVE',
