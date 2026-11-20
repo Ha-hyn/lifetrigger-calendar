@@ -640,7 +640,25 @@ async function handler(req, res) {
   if (req.method === 'GET' && req.query && req.query.diag) {
     // 진단: 단계별 소요 시간 (키 값은 노출하지 않음)
     const d = {}; const t0 = Date.now();
-    try { const t = await loadTables(); d.tables = { ms: Date.now() - t0, policies: t.policies.length, regions: t.regions.length, codes: t.codes.length }; }
+    try {
+      const t = await loadTables();
+      d.tables = { ms: Date.now() - t0, policies: t.policies.length, regions: t.regions.length, codes: t.codes.length };
+      if (req.query.diag === 'schema') {
+        const p0 = t.policies[0] || {};
+        const sample = {};
+        // 짧은 코드성 컬럼만 값 예시 (긴 본문은 길이만)
+        for (const k of Object.keys(p0)) {
+          const vals = [...new Set(t.policies.slice(0, 300).map(r => text(r[k])).filter(Boolean))];
+          const maxLen = Math.max(0, ...vals.map(v => v.length));
+          sample[k] = maxLen <= 40 ? vals.slice(0, 6) : '(본문, 최대 ' + maxLen + '자)';
+        }
+        d.policyColumns = sample;
+        d.regionColumns = Object.keys(t.regions[0] || {});
+        d.codeColumns = Object.keys(t.codes[0] || {});
+        d.codeSample = t.codes.slice(0, 53).map(c => Object.values(c).map(text).join(' | '));
+        return res.status(200).json(d);
+      }
+    }
     catch (e) { d.tables = { ms: Date.now() - t0, error: e.message }; }
     const t1 = Date.now();
     let models = [];
