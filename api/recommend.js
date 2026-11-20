@@ -61,6 +61,9 @@ const POLICY_SYSTEM = `너는 청년 정책 캘린더 "LifeTrigger AI"의 정책
 ④ 신청 시기: 일정 날짜 기준으로 언제 신청해야 하는가? (사전 신청 / 응시 후 신청 / 상시 / 마감)
 ⑤ 제외·중복: 제외 대상, 연간 한도, 중복 수혜 제한이 원문에 있으면 note에 적는다.
 
+[길이 제한 — 빠른 응답을 위해 꼭 지킨다]
+- evidence 최대 2개, 각 80자 이내 / checkItems 최대 2개 / timing.text 40자 이내 / note 60자 이내
+
 [출력 형식]
 {"results":[
   {"policyId":"후보의 policyId 그대로",
@@ -350,7 +353,9 @@ function selectCandidates(ctx, policyRows, regionRows, codeRows) {
     const maxAge = Number(get(row, 'max_age')) || null;
     if (age != null && ((minAge && age < minAge) || (maxAge && age > maxAge))) { stats.age++; continue; }
 
-    const dbRegionNames = text(get(row, 'region_names'));
+    const dbRegionNames = codeList(get(row, 'region_names')).length
+      ? text(get(row, 'region_names')).replace(/[\[\]"]/g, '').split(',').map(s => s.trim()).filter(Boolean).join(', ')
+      : '';
     candidates.push({
       policy_id: id,
       title: text(get(row, 'title')),
@@ -497,7 +502,7 @@ async function recommend(body, deps) {
   if (!base.userCategory && !(base.answers && base.answers.category) && !base.rule.excluded) {
     try {
       const out = await deps.llm(EVENT_SYSTEM,
-        '일정 제목: ' + base.event.title + '\n일정 날짜: ' + (base.event.start || '') + '\n사용자가 고른 카테고리: 없음', 512, 12000);
+        '일정 제목: ' + base.event.title + '\n일정 날짜: ' + (base.event.start || '') + '\n사용자가 고른 카테고리: 없음', 512, 15000);
       ai = Object.assign(ai, parseJsonLoose(out));
     } catch (e) { ai.reason = 'AI 해석 실패: ' + e.message; ai.failed = true; }
   }
@@ -512,31 +517,41 @@ async function recommend(body, deps) {
     return Object.assign({}, ctx, { status: 'NO_CANDIDATES', message: '조건에 맞는 정책을 찾지 못했습니다. 지역 설정을 변경해 보세요.', policies: [], debug });
   }
 
-  // AI 판단 5단계
-  const userMsg = '[사용자 일정]\n- 제목: ' + ctx.event.title +
+  // AI 판단 5단계 — 후보를 4건씩 나눠 동시에 판단 (응답 시간 단축)
+  const header = '[사용자 일정]\n- 제목: ' + ctx.event.title +
     '\n- 유형: ' + ctx.event.categoryLabel + ' ' + (ctx.event.examStage || '') +
     '\n- 날짜: ' + (ctx.event.start || '') +
     '\n- 오늘: ' + todayStr() +
     '\n\n[사용자 조건]\n- 만 나이: ' + ctx.user.age +
-    '\n- 거주 시도코드: ' + ctx.user.sidoCode + ' / 시군구코드: ' + ctx.user.sigunguCode +
-    '\n\n[후보 정책 ' + candidates.length + '건 — 이 목록 밖은 판단하지 않는다]\n' + JSON.stringify(candidatesForAi(candidates));
+    '\n- 거주 시도코드: ' + ctx.user.sidoCode + ' / 시군구코드: ' + ctx.user.sigunguCode;
+  const forAi = candidatesForAi(candidates);
+  const batches = [];
+  for (let i = 0; i < forAi.length; i += 4) batches.push(forAi.slice(i, i + 4));
+  // 남은 시간 안에서 AI 판단 (Vercel 함수 제한 60초, 여유 8초)
+  const budget = Math.max(5000, 50000 - (Date.now() - startedAt));
+  const judgedIds = new Set();
   let judged = [];
-  // 남은 시간 안에서 AI 판단 (Vercel 함수 제한 60초)
-  const budget = Math.max(5000, 52000 - (Date.now() - startedAt));
-  try { judged = parseJsonLoose(await deps.llm(POLICY_SYSTEM, userMsg, 8192, budget)).results || []; }
-  catch (e) { debug.aiError = e.message; }
+  const outs = await Promise.allSettled(batches.map(b => deps.llm(POLICY_SYSTEM,
+    header + '\n\n[후보 정책 ' + b.length + '건 — 이 목록 밖은 판단하지 않는다]\n' + JSON.stringify(b), 3072, budget)));
+  outs.forEach(o => {
+    if (o.status === 'fulfilled') {
+      try { (parseJsonLoose(o.value).results || []).forEach(r => { judged.push(r); judgedIds.add(r.policyId); }); }
+      catch (e) { debug.aiError = 'AI 응답 형식 오류'; }
+    } else debug.aiError = o.reason && o.reason.message;
+  });
 
-  // AI 판단이 실패하면 규칙 기반 후보를 '확인 필요'로 보여 줌 (빈 화면 방지)
-  if (!judged.length && debug.aiError) {
-    judged = candidates.slice(0, 10).map(p => ({
+  // AI가 판단하지 못한 후보는 규칙 기반 '확인 필요'로 보여 줌 (빈 화면 방지)
+  const missed = candidates.filter(p => !judgedIds.has(p.policy_id));
+  if (missed.length && debug.aiError) {
+    judged = judged.concat(missed.slice(0, 10).map(p => ({
       policyId: p.policy_id, relevance: p.rule_relevance, eligibility: 'CHECK', evidence: [], timing: null, note: '',
       checkItems: ['AI 판단이 일시적으로 실패해 규칙으로만 고른 정책입니다. 원문에서 자격 조건을 확인하세요.']
-    }));
+    })));
   }
 
   // ③ 결과 정리
   const result = buildResult(ctx, candidates, judged, debug);
-  if (debug.aiError) result.notices.unshift('AI 판단 서버가 바빠서 규칙 기반 결과만 보여 드려요. 잠시 후 다시 눌러 보세요.');
+  if (debug.aiError && missed.length) result.notices.unshift('AI 판단 서버가 바빠서 ' + missed.length + '건은 규칙으로만 고른 결과예요(확인 필요). 잠시 후 다시 눌러 보세요.');
   result.debug.model = resolvedModel;
   result.debug.elapsedMs = Date.now() - startedAt;
   return result;
@@ -583,7 +598,7 @@ async function listFlashModels() {
   const names = (j.models || [])
     .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
     .map(m => String(m.name || '').replace(/^models\//, ''))
-    .filter(n => /flash/.test(n) && !/lite|image|tts|audio|live|thinking|exp|preview/.test(n));
+    .filter(n => /flash/.test(n) && !/image|tts|audio|live|thinking|exp|preview/.test(n));
   const ver = n => (n.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1] * 1;
   names.sort((a, b) => ver(b) - ver(a) || a.length - b.length);
   if (!names.length) throw new Error('이 Gemini 키로 사용할 수 있는 flash 모델을 찾지 못했습니다. GEMINI_MODEL 환경변수를 지정하세요.');
@@ -597,10 +612,10 @@ async function raceModels() {
   let list = [];
   try { list = await listFlashModels(); } catch (e) { list = []; }
   const preferred = process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
-  const pool = [preferred].concat(list.filter(m => m !== preferred)).slice(0, 6);
+  const pool = [preferred].concat(list.filter(m => m !== preferred)).slice(0, 8);
   try {
     return await Promise.any(pool.map(async m => {
-      const out = await geminiCall(m, 'JSON만 출력한다.', '{"ok":true}', 32, 8000);
+      const out = await geminiCall(m, 'JSON만 출력한다.', '{"ok":true}', 32, 6000);
       if (!out.ok) throw new Error(m + ' ' + out.status);
       return m;
     }));
@@ -609,8 +624,8 @@ async function raceModels() {
 
 // budgetMs: 이 호출 전체(모델 전환 포함)에 쓸 수 있는 시간
 async function gemini(system, user, maxTokens, budgetMs) {
+  const end = Date.now() + (budgetMs || 25000); // 모델 고르는 시간(최대 6초)도 예산에 포함
   if (!resolvedModel) resolvedModel = await raceModels();
-  const end = Date.now() + (budgetMs || 25000);
   const first = resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
   const tried = [];
   let order = [first];
