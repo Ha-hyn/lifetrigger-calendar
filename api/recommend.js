@@ -131,6 +131,7 @@ function decide(base, ai) {
   else if (userCategory) { category = userCategory; decidedBy = 'USER_SELECTED'; }
   else if (rule.excluded || ai.category === 'EXCLUDED') { category = 'GENERAL'; decidedBy = 'EXCLUDED'; }
   else if (rule.strength === 'STRONG' && ai.category === rule.category) { category = rule.category; decidedBy = 'RULE+AI'; }
+  else if (rule.strength === 'STRONG' && ai.failed) { category = rule.category; decidedBy = 'RULE_ONLY'; } // AI 장애 시 강한 규칙 신호로 확정
   else if (rule.category === 'GENERAL' && ai.category === 'GENERAL') { category = 'GENERAL'; decidedBy = 'RULE+AI'; }
   else {
     const opts = [...new Set([ai.category, rule.category, 'GENERAL'].filter(c => LABELS[c]))];
@@ -478,7 +479,7 @@ async function recommend(body, deps) {
       const out = await deps.llm(EVENT_SYSTEM,
         '일정 제목: ' + base.event.title + '\n일정 날짜: ' + (base.event.start || '') + '\n사용자가 고른 카테고리: 없음', 512, 12000);
       ai = Object.assign(ai, parseJsonLoose(out));
-    } catch (e) { ai.reason = 'AI 해석 실패: ' + e.message; }
+    } catch (e) { ai.reason = 'AI 해석 실패: ' + e.message; ai.failed = true; }
   }
 
   const ctx = decide(base, ai);
@@ -587,8 +588,8 @@ async function raceModels() {
 
 // budgetMs: 이 호출 전체(모델 전환 포함)에 쓸 수 있는 시간
 async function gemini(system, user, maxTokens, budgetMs) {
-  const end = Date.now() + (budgetMs || 25000);
   if (!resolvedModel) resolvedModel = await raceModels();
+  const end = Date.now() + (budgetMs || 25000);
   const first = resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT;
   const tried = [];
   let order = [first];
