@@ -625,10 +625,15 @@ async function handler(req, res) {
     try { const t = await loadTables(); d.tables = { ms: Date.now() - t0, policies: t.policies.length, regions: t.regions.length, codes: t.codes.length }; }
     catch (e) { d.tables = { ms: Date.now() - t0, error: e.message }; }
     const t1 = Date.now();
-    try { d.modelList = { model: await pickAvailableModel(), ms: Date.now() - t1 }; } catch (e) { d.modelList = { error: e.message }; }
-    const t2 = Date.now();
-    try { const out = await gemini('JSON만 출력한다.', '{"ok":true} 를 그대로 출력', 64); d.gemini = { ms: Date.now() - t2, model: resolvedModel || process.env.GEMINI_MODEL || GEMINI_MODEL_DEFAULT, out: out.slice(0, 80) }; }
-    catch (e) { d.gemini = { ms: Date.now() - t2, error: e.message }; }
+    let models = [];
+    try { models = await listFlashModels(); d.modelList = { models, ms: Date.now() - t1 }; } catch (e) { d.modelList = { error: e.message }; }
+    // 모델별 짧은 호출을 동시에 시험 (각 8초 제한)
+    d.probe = {};
+    await Promise.all(models.slice(0, 6).map(async m => {
+      const s = Date.now();
+      const out = await geminiCall(m, 'JSON만 출력한다.', '{"ok":true} 를 그대로 출력', 64, 8000);
+      d.probe[m] = { ok: out.ok, status: out.status, ms: Date.now() - s };
+    }));
     return res.status(200).json(d);
   }
   if (req.method === 'GET') {
